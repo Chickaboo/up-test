@@ -21,7 +21,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QFileInfo, Qt
@@ -48,6 +48,7 @@ from gambitpairing.gui.tabs import (
 from gambitpairing.tournament import Tournament
 from gambitpairing.update import Updater, UpdateWorker
 from gambitpairing.utils import setup_logger
+from gambitpairing.utils.restart import restart_application as perform_restart
 
 logger = setup_logger(__name__)
 
@@ -66,9 +67,13 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         self._current_filepath: Optional[str] = None
         self._dirty: bool = False
         self.is_updating = False
+        self._pending_update_path: Optional[str] = None
         self.updater: Optional[Updater] = Updater(APP_VERSION)
         # import player is a class containing import player logic
         self.import_mgr = ImportPlayer(self)
+        self.download_dialog: Optional[UpdateDownloadDialog] = None
+        self._update_thread: Optional[QtCore.QThread] = None
+        self._update_worker: Optional[UpdateWorker] = None
 
         self._setup_ui()
         self._update_ui_state()
@@ -783,10 +788,13 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        latest_version_str = cast(str, latest_version)
+        release_notes_str = cast(str, release_notes)
+
         dialog = UpdatePromptDialog(
-            new_version=latest_version,
+            new_version=latest_version_str,
             current_version=APP_VERSION,
-            release_notes=release_notes,
+            release_notes=release_notes_str,
             parent=self,
         )
 
@@ -798,47 +806,84 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         if not self.updater:
             return
 
-        self.statusBar().showMessage("Starting update download...")
+        self._show_status_message("Starting update download...")
         self.download_dialog = UpdateDownloadDialog(self)
+        self.download_dialog.restart_requested.connect(
+            self._handle_restart_requested
+        )
+        self.download_dialog.finished.connect(self._on_download_dialog_closed)
+        self._pending_update_path = None
 
-        self.thread = QtCore.QThread()
-        self.worker = UpdateWorker(self.updater)
-        self.worker.moveToThread(self.thread)
+        self._update_thread = QtCore.QThread()
+        self._update_worker = UpdateWorker(self.updater)
+        self._update_worker.moveToThread(self._update_thread)
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.download_dialog.update_progress)
-        self.worker.status.connect(self.download_dialog.update_status)
-        self.worker.done.connect(self.on_update_done)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.progress.connect(self.download_dialog.update_progress)
+        self._update_worker.status.connect(self.download_dialog.update_status)
+        self._update_worker.done.connect(self.on_update_done)
 
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_worker.finished.connect(self._update_worker.deleteLater)
+        self._update_thread.finished.connect(self._update_thread.deleteLater)
+        self._update_thread.finished.connect(self._clear_update_thread_refs)
 
-        self.worker.error.connect(self.thread.quit)
-        self.worker.error.connect(self.worker.deleteLater)
+        self._update_worker.error.connect(self._update_thread.quit)
+        self._update_worker.error.connect(self._update_worker.deleteLater)
 
-        self.thread.start()
+        self._update_thread.start()
         self.download_dialog.exec()
 
     def on_update_done(self, success: bool, message: str):
         """Handle both success and error for update in a modern dialog."""
+        if not self.download_dialog:
+            logger.error("Update download dialog not available to display results.")
+            return
         if success:
+            self._pending_update_path = message
             self.download_dialog.show_complete()
-            # Connect restart button to restart logic
-            self.download_dialog.restart_btn.clicked.disconnect()
-            self.download_dialog.restart_btn.clicked.connect(
-                lambda: self._restart_with_update(message)
+            self._show_status_message(
+                "Update downloaded. Restart to apply when ready."
             )
         else:
+            self._pending_update_path = None
             self.download_dialog.show_error(message)
-            self.download_dialog.close_btn.clicked.disconnect()
-            self.download_dialog.close_btn.clicked.connect(self.download_dialog.close)
+            self._show_status_message("Update failed. See details in dialog.")
+
+    def _handle_restart_requested(self):
+        if not self._pending_update_path:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Update Not Ready",
+                "The update files are missing or already removed. Please download again.",
+            )
+            return
+        pending_path = self._pending_update_path
+        self._pending_update_path = None
+        if self.download_dialog:
+            self.download_dialog.close()
+        self._restart_with_update(pending_path)
 
     def _restart_with_update(self, extracted_path: str):
         self.is_updating = True
-        self.statusBar().showMessage("Scheduling update apply & restart...")
+        self._show_status_message("Scheduling update apply & restart...")
+        if not self.updater:
+            logger.error("Updater not available; cannot apply update.")
+            return
         self.updater.apply_update(extracted_path)
         QtCore.QTimer.singleShot(150, self.close)
+
+    def _clear_update_thread_refs(self) -> None:
+        self._update_thread = None
+        self._update_worker = None
+
+    def _on_download_dialog_closed(self, _result: int) -> None:
+        self.download_dialog = None
+
+    def _show_status_message(self, message: str) -> None:
+        status_bar = self.statusBar()
+        if status_bar is not None:
+            status_bar.showMessage(message)
 
     def closeEvent(self, event: QCloseEvent):
         if self.is_updating:
@@ -863,7 +908,7 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
 
     def restart_application(self):
         """Restart the application cleanly."""
-        utils.restart_application()
+        perform_restart()
 
     def get_confirmation(
         self, action="", message="Are you sure you want to proceed?"

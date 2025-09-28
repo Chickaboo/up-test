@@ -18,19 +18,25 @@
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import httpx
 from packaging.version import Version, parse as parse_version
 
+from gambitpairing import APP_NAME, APP_VERSION
 from gambitpairing.constants import UPDATE_URL
 from gambitpairing.utils import setup_logger
 
 logger = setup_logger(__name__)
+
+
+T = TypeVar("T")
 
 
 class Updater:
@@ -55,6 +61,13 @@ class Updater:
     PENDING_FINAL_DIR = "final"  # previous compatibility name
     METADATA_FILENAME = "update_meta.json"
 
+    DEFAULT_HEADERS = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"{APP_NAME} Updater/{APP_VERSION}",
+    }
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE_SECONDS = 1.5
+
     def __init__(
         self,
         current_version: str,
@@ -75,23 +88,62 @@ class Updater:
         self.update_zip_path: Optional[str] = None
         self.expected_checksum: Optional[str] = None
         self._etag: Optional[str] = None  # simple in-memory cache marker
+        self._headers = dict(self.DEFAULT_HEADERS)
+        self._headers.setdefault("X-GP-Updater", "1")
 
     # ---------------- Version / Release Data -----------------
+    def _create_client(self, *, timeout: float) -> httpx.Client:
+        # Ensure read timeout is generous for downloads
+        http_timeout = httpx.Timeout(timeout, connect=min(timeout, 10.0), read=timeout, write=timeout)
+        return httpx.Client(
+            timeout=http_timeout,
+            headers=self._headers,
+            follow_redirects=True,
+        )
+
+    def _with_retries(self, operation: str, func: Callable[[], T]) -> T:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                return func()
+            except (httpx.HTTPError, OSError) as exc:  # network related errors
+                last_exc = exc
+                if attempt == self.MAX_RETRIES:
+                    break
+                delay = min(self.timeout_s, self.RETRY_BACKOFF_BASE_SECONDS ** (attempt - 1))
+                logger.warning(
+                    f"{operation} failed (attempt {attempt}/{self.MAX_RETRIES}): {exc}. Retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                # Non-network error; do not retry to avoid repeated failures
+                raise exc
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"{operation} failed without raising an exception.")
+
     def _fetch_latest_release(self) -> Optional[Dict[str, Any]]:
         headers = {}
         if self._etag:
             headers["If-None-Match"] = self._etag
-        try:
-            with httpx.Client(timeout=self.timeout_s) as client:
+
+        def _request():
+            with self._create_client(timeout=self.timeout_s) as client:
                 response = client.get(UPDATE_URL, headers=headers)
                 if response.status_code == 304:  # Not Modified
                     logger.debug("Release not modified (ETag matched).")
                     return self.latest_version_info
                 response.raise_for_status()
                 self._etag = response.headers.get("ETag")
+                rate_remaining = response.headers.get("X-RateLimit-Remaining")
+                if rate_remaining is not None:
+                    logger.debug(f"GitHub API rate limit remaining: {rate_remaining}")
                 data = response.json()
                 self.latest_version_info = data
                 return data
+
+        try:
+            return self._with_retries("Fetch release metadata", _request)
         except Exception as e:
             logger.error(f"Failed to fetch release info: {e}")
             return None
@@ -173,13 +225,17 @@ class Updater:
             url = checksum_asset.get("browser_download_url")
             if not url:
                 return
-            with httpx.Client(timeout=self.timeout_s) as client:
-                r = client.get(url)
-                r.raise_for_status()
-                text = r.text.strip().splitlines()[0].strip()
-                # Accept formats: '<hash>  filename' OR just '<hash>'
-                self.expected_checksum = text.split()[0]
-                logger.info(f"Expected checksum: {self.expected_checksum}")
+
+            def _request():
+                with self._create_client(timeout=self.timeout_s) as client:
+                    r = client.get(url)
+                    r.raise_for_status()
+                    text = r.text.strip().splitlines()[0].strip()
+                    # Accept formats: '<hash>  filename' OR just '<hash>'
+                    self.expected_checksum = text.split()[0]
+                    logger.info(f"Expected checksum: {self.expected_checksum}")
+
+            self._with_retries("Download checksum", _request)
         except Exception as e:
             logger.warning(f"Checksum download failed: {e}")
 
@@ -197,24 +253,42 @@ class Updater:
         temp_dir = Path(tempfile.gettempdir()) / self.PENDING_ROOT_NAME
         temp_dir.mkdir(parents=True, exist_ok=True)
         target = temp_dir / "update_download.zip"
-        try:
-            with httpx.Client(timeout=self.timeout_s * 4) as client:
+        temp_target = target.with_suffix(".part")
+
+        def _download():
+            if temp_target.exists():
+                try:
+                    temp_target.unlink()
+                except FileNotFoundError:
+                    pass
+            with self._create_client(timeout=self.timeout_s * 4) as client:
                 with client.stream("GET", url) as resp:
                     resp.raise_for_status()
-                    total = int(resp.headers.get("content-length", 0))
+                    total_header = resp.headers.get("content-length")
+                    total = int(total_header) if total_header and total_header.isdigit() else 0
                     downloaded = 0
-                    with open(target, "wb") as fh:
+                    with open(temp_target, "wb") as fh:
                         for chunk in resp.iter_bytes(chunk_size=64 * 1024):
                             if not chunk:
                                 continue
                             fh.write(chunk)
                             downloaded += len(chunk)
-                            if progress_callback and total > 0:
-                                try:
+                            if progress_callback:
+                                if total > 0:
                                     pct = int(downloaded / total * 100)
-                                    progress_callback(min(pct, 100))
-                                except Exception:
-                                    pass
+                                    progress_callback(min(pct, 99))
+                                else:
+                                    # For unknown length, emit a heartbeat progress (best effort)
+                                    progress_callback(min(downloaded // (512 * 1024), 99))
+            temp_target.replace(target)
+
+        try:
+            self._with_retries("Download update asset", _download)
+            if progress_callback:
+                try:
+                    progress_callback(100)
+                except Exception:
+                    pass
             self.update_zip_path = str(target)
             return self.update_zip_path
         except Exception as e:
@@ -318,38 +392,62 @@ class Updater:
             # Build batch script
             script_path = self._staging_root() / "apply_update.bat"
             relaunch_cmd = f'"{app_exe}"'
-            copy_commands: List[str] = []
-            for root_dir, _unused_dirs, files in os.walk(update_dir):
-                rel_root = Path(root_dir).relative_to(update_dir)
-                target_root = app_dir / rel_root
-                copy_commands.append(f'mkdir "{target_root}" >NUL 2>&1')
-                for file in files:
-                    src_file = Path(root_dir) / file
-                    dst_file = target_root / file
-                    # Skip replacing the currently running exe until after exit; handled by wait loop
-                    copy_commands.append(
-                        f'copy /Y "{src_file}" "{dst_file}" >NUL'
-                    )
-            # Batch script content
+            current_pid = os.getpid()
+            staging_root = self._staging_root()
+
             script_content = [
                 "@echo off",
+                "setlocal ENABLEEXTENSIONS",
+                f'set "GP_SOURCE={update_dir}"',
+                f'set "GP_TARGET={app_dir}"',
+                f'set "GP_EXE={app_exe}"',
+                f'set "GP_PID={current_pid}"',
+                f'set "GP_STAGING={staging_root}"',
+                f'set "GP_SCRIPT={script_path}"',
                 "echo Applying Gambit Pairing update...",
-                "set RETRIES=50",
-                f':waitloop',
-                f'PING 127.0.0.1 -n 2 >NUL',
-                f'if exist "{app_exe}" (',
-                f'  openfiles >NUL 2>&1',  # best effort; may require privileges
+                "echo Waiting for Gambit Pairing to exit...",
+                ":waitloop",
+                'set "GP_FOUND="',
+                "for /f \"skip=3 tokens=2\" %%P in ('tasklist /FI \"PID eq %GP_PID%\" 2^>NUL') do set \"GP_FOUND=%%P\"",
+                "if defined GP_FOUND (",
+                '    timeout /T 1 /NOBREAK >NUL',
+                '    goto waitloop',
                 ')',
-                # Attempt copy operations
+                'set "GP_ELEVATED="',
+                'for /f "tokens=*" %%G in ("whoami /groups ^| find \"S-1-16-12288\"") do set "GP_ELEVATED=1"',
+                "if not defined GP_ELEVATED goto requireAdmin",
+                "goto copyfiles",
+                ":requireAdmin",
+                'echo Requesting administrator approval to update "%GP_TARGET%"...',
+                    "powershell -NoProfile -Command \"Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', '\"%GP_SCRIPT%\"') -Verb RunAs\"",
+                'if ERRORLEVEL 1 goto fail_admin',
+                'exit /b 0',
+                ":copyfiles",
+                "echo Copying updated files (robocopy)...",
+                'robocopy "%GP_SOURCE%" "%GP_TARGET%" /MIR /R:5 /W:2 /NFL /NDL /NP /NJH /NJS',
+                'set "GP_RC=%ERRORLEVEL%"',
+                'if %GP_RC% GEQ 8 goto robofail',
+                'goto success',
+                ":robofail",
+                'echo Robocopy returned %GP_RC%. Attempting XCOPY fallback...',
+                'xcopy "%GP_SOURCE%\\*" "%GP_TARGET%" /E /H /C /Y /I >NUL',
+                'if ERRORLEVEL 1 goto fail',
+                'goto success',
+                ":fail_admin",
+                "echo Update cancelled: administrator approval is required.",
+                "pause >NUL",
+                "exit /b 1",
+                ":fail",
+                "echo Update failed. Press any key to exit.",
+                "pause >NUL",
+                "exit /b 1",
+                ":success",
+                'echo Scheduling cleanup of staging files...',
+                'start "" cmd /c "(ping 127.0.0.1 -n 3 >NUL) & rd /S /Q \"%GP_STAGING%\" & del /Q \"%GP_SCRIPT%\"" >NUL 2>&1',
+                "echo Update applied. Launching application...",
+                f'start "Gambit Pairing" {relaunch_cmd}',
+                "exit /b 0",
             ]
-            script_content.extend(copy_commands)
-            script_content.extend(
-                [
-                    "echo Update applied. Launching application...",
-                    f'start "Gambit Pairing" {relaunch_cmd}',
-                    "exit /b 0",
-                ]
-            )
             try:
                 script_path.write_text("\n".join(script_content), encoding="utf-8")
                 logger.info(f"Update apply script written to {script_path}")
@@ -358,7 +456,8 @@ class Updater:
                 return
             # Launch script and exit
             try:
-                os.startfile(str(script_path))  # type: ignore[attr-defined]
+                creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                subprocess.Popen(["cmd.exe", "/c", str(script_path)], creationflags=creationflags)
                 logger.info("Launched update apply script; exiting for replacement.")
             except Exception as e:
                 logger.error(f"Failed to start apply script: {e}")

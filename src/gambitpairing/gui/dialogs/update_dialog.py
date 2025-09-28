@@ -4,6 +4,8 @@ from PyQt6 import QtCore, QtWidgets
 class UpdateDownloadDialog(QtWidgets.QDialog):
     """Dialog to show download progress, completion, and errors with a modern look."""
 
+    restart_requested = QtCore.pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Updating Gambit Pairing")
@@ -35,9 +37,9 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
         """
         )
 
-        self.layout = QtWidgets.QVBoxLayout(self)
-        self.layout.setContentsMargins(20, 20, 20, 20)
-        self.layout.setSpacing(15)
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+        self.main_layout.setSpacing(15)
 
         self.status_label = QtWidgets.QLabel("Connecting...", self)
         self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -49,25 +51,26 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
         self.status_label.setStyleSheet(
             "padding-left: 12px; padding-right: 12px;"
         )  # <-- Fix: add horizontal padding
-        self.layout.addWidget(self.status_label)
+        self.main_layout.addWidget(self.status_label)
 
         self.progress_bar = QtWidgets.QProgressBar(self)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.layout.addWidget(self.progress_bar)
+        self.main_layout.addWidget(self.progress_bar)
 
         self.button_box = QtWidgets.QDialogButtonBox(self)
         self.restart_btn = self.button_box.addButton(
-            "Close", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
+            "Restart Now", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
         )
         self.close_btn = self.button_box.addButton(
-            "Done", QtWidgets.QDialogButtonBox.ButtonRole.RejectRole
+            "Later", QtWidgets.QDialogButtonBox.ButtonRole.RejectRole
         )
         self.restart_btn.hide()
         self.close_btn.hide()
-        self.layout.addWidget(self.button_box)
+        self.main_layout.addWidget(self.button_box)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
+        self.restart_btn.clicked.connect(self._handle_restart_clicked)
 
         # Prevent closing the dialog with the 'X' button
         self.setWindowFlag(QtCore.Qt.WindowType.WindowCloseButtonHint, False)
@@ -84,8 +87,10 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
     def show_complete(self):
         self.progress_bar.setValue(100)
         self.status_label.setText(
-            "Update downloaded! Please close and restart the application to apply it."
+            "Update downloaded and ready to install. Click Restart Now to apply immediately, or Later to finish current work."
         )
+        self.restart_btn.setText("Restart Now")
+        self.close_btn.setText("Later")
         self.restart_btn.show()
         self.close_btn.show()
         self.progress_bar.setEnabled(False)
@@ -97,6 +102,7 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
         self.progress_bar.setEnabled(False)
         self.restart_btn.hide()
         self.close_btn.show()
+        self.close_btn.setText("Close")
 
     def closeEvent(self, event):
         # Only allow closing if buttons are visible (after update or error)
@@ -104,3 +110,6 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
             event.accept()
         else:
             event.ignore()
+
+    def _handle_restart_clicked(self):
+        self.restart_requested.emit()

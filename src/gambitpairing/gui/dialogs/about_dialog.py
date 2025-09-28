@@ -78,7 +78,7 @@ class AboutDialog(QDialog):
             }
         """
         )
-        tab_widget.addTab(self._create_about_tab(), "Hello World")
+        tab_widget.addTab(self._create_about_tab(), "About")
         tab_widget.addTab(self._create_license_tab(), "License")
 
         # Make sure tab widget expands properly
