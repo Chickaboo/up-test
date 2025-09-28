@@ -47,6 +47,7 @@ from gambitpairing.gui.tabs import (
 )
 from gambitpairing.tournament import Tournament
 from gambitpairing.update import Updater, UpdateWorker
+from gambitpairing.update.updater import UpdatePackage
 from gambitpairing.utils import setup_logger
 from gambitpairing.utils.restart import restart_application as perform_restart
 
@@ -67,13 +68,14 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         self._current_filepath: Optional[str] = None
         self._dirty: bool = False
         self.is_updating = False
-        self._pending_update_path: Optional[str] = None
+        self._pending_package: Optional[UpdatePackage] = None
         self.updater: Optional[Updater] = Updater(APP_VERSION)
         # import player is a class containing import player logic
         self.import_mgr = ImportPlayer(self)
         self.download_dialog: Optional[UpdateDownloadDialog] = None
         self._update_thread: Optional[QtCore.QThread] = None
         self._update_worker: Optional[UpdateWorker] = None
+        self._app_instance: Optional[QtWidgets.QApplication] = None
 
         self._setup_ui()
         self._update_ui_state()
@@ -707,34 +709,32 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         if not self.updater:
             return False
 
-        pending_path = self.updater.get_pending_update_path()
-        if pending_path:
+        pending_package = self.updater.get_pending_package()
+        if pending_package:
+            version_note = (
+                f" version {pending_package.version}" if pending_package.version else ""
+            )
             reply = QtWidgets.QMessageBox.question(
                 self,
-                "Update Ready to Install",
-                "A downloaded update is ready. This will restart the application.\n\nInstall now?",
+                "Update Installer Ready",
+                f"A downloaded installer{version_note} is ready.\nThis will close Gambit Pairing and launch the installer.\n\nLaunch it now?",
                 QtWidgets.QMessageBox.StandardButton.Yes
                 | QtWidgets.QMessageBox.StandardButton.No,
             )
 
             if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-                self.is_updating = True
-                self.statusBar().showMessage("Scheduling update apply & restart...")
-                # apply_update now schedules a replacement script (Windows) or performs copy (POSIX)
-                self.updater.apply_update(pending_path)
-                QtCore.QTimer.singleShot(150, self.close)
-                return True  # Update is being applied
-            else:
-                # User chose not to install. Let's ask if they want to discard it.
-                discard_reply = QtWidgets.QMessageBox.question(
-                    self,
-                    "Discard Update?",
-                    "Do you want to discard the downloaded update? If not, you will be asked again on the next launch.",
-                    QtWidgets.QMessageBox.StandardButton.Yes
-                    | QtWidgets.QMessageBox.StandardButton.No,
-                )
-                if discard_reply == QtWidgets.QMessageBox.StandardButton.Yes:
-                    self.updater.cleanup_pending_update()
+                self._install_update(pending_package)
+                return True
+
+            discard_reply = QtWidgets.QMessageBox.question(
+                self,
+                "Discard Installer?",
+                "Do you want to delete the downloaded installer? If not, you will be asked again next time.",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if discard_reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.updater.clear_pending_package(remove_files=True)
         return False
 
     def check_for_updates_manual(self) -> None:
@@ -753,12 +753,12 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        self.statusBar().showMessage("Checking for updates...")
+        self._show_status_message("Checking for updates...")
         has_update = self.updater.check_for_updates()
         if has_update:
             self.prompt_update()
         else:
-            self.statusBar().showMessage("No new updates available.")
+            self._show_status_message("No new updates available.")
             QtWidgets.QMessageBox.information(
                 self,
                 "Update Check",
@@ -776,7 +776,7 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
 
     def prompt_update(self):
         """Show a modern dialog prompting the user to download the new version."""
-        if not self.updater or not self.updater.latest_version_info:
+        if not self.updater:
             return
 
         latest_version = self.updater.get_latest_version()
@@ -808,11 +808,11 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
 
         self._show_status_message("Starting update download...")
         self.download_dialog = UpdateDownloadDialog(self)
-        self.download_dialog.restart_requested.connect(
-            self._handle_restart_requested
+        self.download_dialog.install_requested.connect(
+            self._handle_install_requested
         )
         self.download_dialog.finished.connect(self._on_download_dialog_closed)
-        self._pending_update_path = None
+        self._pending_package = None
 
         self._update_thread = QtCore.QThread()
         self._update_worker = UpdateWorker(self.updater)
@@ -834,44 +834,72 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         self._update_thread.start()
         self.download_dialog.exec()
 
-    def on_update_done(self, success: bool, message: str):
+    def on_update_done(self, success: bool, payload: object):
         """Handle both success and error for update in a modern dialog."""
         if not self.download_dialog:
             logger.error("Update download dialog not available to display results.")
             return
         if success:
-            self._pending_update_path = message
+            package = cast(UpdatePackage, payload)
+            self._pending_package = package
             self.download_dialog.show_complete()
             self._show_status_message(
-                "Update downloaded. Restart to apply when ready."
+                "Update installer downloaded. Install whenever you're ready."
             )
         else:
-            self._pending_update_path = None
-            self.download_dialog.show_error(message)
+            error_message = cast(str, payload)
+            self._pending_package = None
+            self.download_dialog.show_error(error_message)
             self._show_status_message("Update failed. See details in dialog.")
 
-    def _handle_restart_requested(self):
-        if not self._pending_update_path:
+    def _handle_install_requested(self):
+        if not self._pending_package:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Update Not Ready",
-                "The update files are missing or already removed. Please download again.",
+                "The installer is missing or already removed. Please download again.",
             )
             return
-        pending_path = self._pending_update_path
-        self._pending_update_path = None
+        package = self._pending_package
         if self.download_dialog:
             self.download_dialog.close()
-        self._restart_with_update(pending_path)
+        self._install_update(package)
 
-    def _restart_with_update(self, extracted_path: str):
-        self.is_updating = True
-        self._show_status_message("Scheduling update apply & restart...")
+    def _install_update(self, package: UpdatePackage) -> None:
         if not self.updater:
-            logger.error("Updater not available; cannot apply update.")
+            logger.error("Updater not available; cannot launch installer.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Update Error",
+                "The updater is not available, so the installer could not be launched.",
+            )
             return
-        self.updater.apply_update(extracted_path)
-        QtCore.QTimer.singleShot(150, self.close)
+
+        self.is_updating = True
+        self._pending_package = package
+        self._show_status_message("Launching update installer...")
+
+        success = self.updater.install_package(package)
+        if success:
+            self._pending_package = None
+            self._show_status_message(
+                "Installer launched. Follow the prompts to finish updating."
+            )
+            QtCore.QTimer.singleShot(150, self.close)
+            return
+
+        # Installer failed to launch; keep download and inform the user.
+        self.is_updating = False
+        self._show_status_message(
+            "Unable to launch installer. Please try again or run it manually."
+        )
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Installer Launch Failed",
+            "Gambit Pairing couldn't launch the installer automatically.\n"
+            "You can try again from Help → Check for Updates, or run the file manually:\n\n"
+            f"{package.file_path}",
+        )
 
     def _clear_update_thread_refs(self) -> None:
         self._update_thread = None
@@ -885,7 +913,7 @@ class GambitPairingMainWindow(QtWidgets.QMainWindow):
         if status_bar is not None:
             status_bar.showMessage(message)
 
-    def closeEvent(self, event: QCloseEvent):
+    def closeEvent(self, event: QCloseEvent):  # type: ignore[override]
         if self.is_updating:
             event.accept()
             return

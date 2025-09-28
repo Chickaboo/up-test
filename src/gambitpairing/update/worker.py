@@ -1,71 +1,55 @@
-"""update worker for updating Gambit Pairing."""
+"""Background worker for downloading and preparing an update package."""
 
 # Gambit Pairing
-# Copyright (C) 2025  Gambit Pairing developers
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import logging
+from typing import Any, Optional
 
 from PyQt6 import QtCore
 
+from .updater import UpdatePackage
+
 
 class UpdateWorker(QtCore.QObject):
-    """Worker thread for handling the update process in the background."""
+    """Worker thread for handling the update download pipeline."""
 
     progress = QtCore.pyqtSignal(int)
     status = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal(str)  # Returns extracted path
+    finished = QtCore.pyqtSignal(object)  # Optional[UpdatePackage]
     error = QtCore.pyqtSignal(str)
-    done = QtCore.pyqtSignal(bool, str)  # (success, message or extracted_path)
+    done = QtCore.pyqtSignal(bool, object)  # (success, UpdatePackage | str)
 
-    def __init__(self, updater):
+    def __init__(self, updater: Any) -> None:
         super().__init__()
         self.updater = updater
 
-    def run(self):
-        """Execute update download and verification process."""
+    def run(self) -> None:
+        """Execute update download, verification, and staging."""
+        package: Optional[UpdatePackage] = None
         try:
-            # 1. Download
-            self.status.emit("Downloading update...")
-            zip_path = self.updater.download_update(self.progress.emit)
-            if not zip_path:
-                self.error.emit("Failed to download update.")
-                self.done.emit(False, "Failed to download update.")
+            self.status.emit("Downloading update installer...")
+            package = self.updater.download_update(self.progress.emit)
+            if not package:
+                message = "Failed to download update installer."
+                self.error.emit(message)
+                self.done.emit(False, message)
                 return
 
-            # 2. Verify
-            self.status.emit("Verifying checksum...")
-            verified = self.updater.verify_checksum(zip_path)
-            if not verified:
-                self.error.emit(
-                    "Checksum verification failed. The file may be corrupted or tampered with."
+            self.status.emit("Verifying download integrity...")
+            if not self.updater.verify_package(package):
+                self.updater.clear_pending_package(remove_files=True)
+                message = (
+                    "Checksum verification failed. The download may be corrupted."
                 )
-                self.done.emit(False, "Checksum verification failed.")
+                self.error.emit(message)
+                self.done.emit(False, message)
                 return
 
-            # 3. Extract
-            self.status.emit("Extracting update...")
-            extracted_path = self.updater.extract_update()
-            if not extracted_path:
-                self.error.emit("Failed to extract update file.")
-                self.done.emit(False, "Failed to extract update file.")
-                return
-            self.status.emit("Update ready to install.")
-            self.finished.emit(extracted_path)
-            self.done.emit(True, extracted_path)
-        except Exception as e:
-            logging.error(f"Error in update worker: {e}", exc_info=True)
-            self.error.emit(f"An unexpected error occurred: {e}")
-            self.done.emit(False, f"An unexpected error occurred: {e}")
+            self.status.emit("Update installer ready.")
+            self.finished.emit(package)
+            self.done.emit(True, package)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.error("Error in update worker", exc_info=True)
+            message = f"An unexpected error occurred: {exc}"
+            self.error.emit(message)
+            self.done.emit(False, message)

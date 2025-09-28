@@ -4,7 +4,7 @@ from PyQt6 import QtCore, QtWidgets
 class UpdateDownloadDialog(QtWidgets.QDialog):
     """Dialog to show download progress, completion, and errors with a modern look."""
 
-    restart_requested = QtCore.pyqtSignal()
+    install_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,18 +59,18 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
         self.main_layout.addWidget(self.progress_bar)
 
         self.button_box = QtWidgets.QDialogButtonBox(self)
-        self.restart_btn = self.button_box.addButton(
-            "Restart Now", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
+        self.install_btn = self.button_box.addButton(
+            "Install Now", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
         )
         self.close_btn = self.button_box.addButton(
             "Later", QtWidgets.QDialogButtonBox.ButtonRole.RejectRole
         )
-        self.restart_btn.hide()
+        self.install_btn.hide()
         self.close_btn.hide()
         self.main_layout.addWidget(self.button_box)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
-        self.restart_btn.clicked.connect(self._handle_restart_clicked)
+        self.install_btn.clicked.connect(self._handle_install_clicked)
 
         # Prevent closing the dialog with the 'X' button
         self.setWindowFlag(QtCore.Qt.WindowType.WindowCloseButtonHint, False)
@@ -87,11 +87,11 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
     def show_complete(self):
         self.progress_bar.setValue(100)
         self.status_label.setText(
-            "Update downloaded and ready to install. Click Restart Now to apply immediately, or Later to finish current work."
+            "Update installer downloaded. Click Install Now to launch it immediately, or Later if you want to run it yourself later."
         )
-        self.restart_btn.setText("Restart Now")
+        self.install_btn.setText("Install Now")
         self.close_btn.setText("Later")
-        self.restart_btn.show()
+        self.install_btn.show()
         self.close_btn.show()
         self.progress_bar.setEnabled(False)
 
@@ -100,16 +100,16 @@ class UpdateDownloadDialog(QtWidgets.QDialog):
             f"<span style='color:#c00;'>Update failed:</span><br>{error_text}"
         )
         self.progress_bar.setEnabled(False)
-        self.restart_btn.hide()
+        self.install_btn.hide()
         self.close_btn.show()
         self.close_btn.setText("Close")
 
     def closeEvent(self, event):
         # Only allow closing if buttons are visible (after update or error)
-        if self.restart_btn.isVisible() or self.close_btn.isVisible():
+        if self.install_btn.isVisible() or self.close_btn.isVisible():
             event.accept()
         else:
             event.ignore()
 
-    def _handle_restart_clicked(self):
-        self.restart_requested.emit()
+    def _handle_install_clicked(self):
+        self.install_requested.emit()
