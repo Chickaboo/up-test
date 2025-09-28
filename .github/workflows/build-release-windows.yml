@@ -11,6 +11,11 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      onefile_exe: ''
+      onedir_archive: ''
+      msi_path: ''
+      msi_name: ''
 
     steps:
     - name: Checkout code
@@ -135,15 +140,16 @@ jobs:
           exit 1
         }
 
-        # Check MSI installer (make_msi.py now writes to build\gambit-pairing-msi)
-        $msi = Get-ChildItem "build\gambit-pairing-msi\*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+        # Check MSI installer
+        $msiDir = "build\gambit-pairing-msi"
+        $msi = Get-ChildItem "$msiDir\*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($msi) {
           $size = $msi.Length / 1MB
           Write-Host "[+] MSI installer: $($msi.FullName) ($([math]::Round($size, 1)) MB)"
           echo "msi_path=$($msi.FullName)" >> $env:GITHUB_ENV
           echo "msi_name=$($msi.Name)" >> $env:GITHUB_ENV
         } else {
-          Write-Host "[x] MSI installer not found in build\\gambit-pairing-msi directory"
+          Write-Host "[x] MSI installer not found in $msiDir directory"
           exit 1
         }
 
